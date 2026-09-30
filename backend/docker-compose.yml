@@ -1,0 +1,47 @@
+# Docker Compose for the ShowPickr backend on a single EC2 instance.
+#
+#   backend  -> Node + Express + Socket.io (built from ./Dockerfile)
+#   caddy    -> automatic HTTPS (Let's Encrypt) + reverse proxy to :4000
+#
+# Runtime secrets/values are read from backend/.env (written by deploy/backend/deploy.sh
+# from GitHub Actions secrets). It is gitignored and never committed.
+#
+# The SQLite file lives in a named Docker volume mounted at /app/prisma/data, so it
+# survives container restarts and redeploys. DATABASE_URL=file:./data/prod.db resolves
+# relative to prisma/schema.prisma -> /app/prisma/data/prod.db.
+
+services:
+  backend:
+    build: .
+    restart: unless-stopped
+    environment:
+      PORT: "4000"
+      DATABASE_URL: file:./data/prod.db
+      MOTN_API_KEY: ${MOTN_API_KEY:-}
+      CORS_ORIGIN: ${CORS_ORIGIN:-*}
+      MOTN_CACHE: "0" # cache is off in production by default; set "1" to enable
+    volumes:
+      - db-data:/app/prisma/data
+    expose:
+      - "4000"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      # e.g. api.example.com (enables auto-HTTPS) or :80 for plain HTTP testing.
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  db-data:
+  caddy-data:
+  caddy-config:

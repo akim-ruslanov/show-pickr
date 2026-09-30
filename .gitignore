@@ -1,0 +1,32 @@
+# dependencies
+node_modules/
+
+# builds
+dist/
+backend/dist/
+frontend/dist/
+
+# env
+.env
+.env.local
+.env.*.local
+backend/.env
+
+# logs
+*.log
+npm-debug.log*
+
+# misc
+.DS_Store
+.idea/
+.vscode/
+
+# API response cache (local dev)
+.cache/
+backend/.cache/
+
+# SQLite
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

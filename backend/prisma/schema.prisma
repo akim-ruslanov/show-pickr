@@ -1,0 +1,54 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Session {
+  id            String   @id @default(cuid())
+  code          String   @unique
+  status        String   @default("lobby") // lobby | picking | matched | no-match
+  filters       Json
+  groupSize     Int      @default(2) // fixed number of people needed for consensus
+  deck          Json     @default("[]")
+  hasMore       Boolean  @default(false)
+  nextCursor    String?
+  matchedShow   Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  members Member[]
+  swipes  Swipe[]
+}
+
+model Member {
+  id        String   @id @default(cuid())
+  sessionId String
+  session   Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  name      String
+  isHost    Boolean  @default(false)
+  finished  Boolean  @default(false)
+  joinedAt  DateTime @default(now())
+  lastSeen  DateTime @default(now())
+
+  swipes Swipe[]
+
+  @@index([sessionId])
+}
+
+model Swipe {
+  id        String   @id @default(cuid())
+  sessionId String
+  session   Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  memberId  String
+  member    Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  showId    String
+  direction String // yes | no
+  createdAt DateTime @default(now())
+
+  @@unique([sessionId, memberId, showId])
+  @@index([sessionId, showId])
+}
