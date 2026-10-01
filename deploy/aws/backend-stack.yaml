@@ -1,0 +1,264 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ShowPickr backend infrastructure: GitHub OIDC -> deploy role, EC2 instance
+  (SSM-managed, no SSH), Elastic IP, and an S3 bucket for SSM command output.
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Default: akim-ruslanov/show-pickr
+    Description: GitHub owner/repo allowed to assume the deploy role.
+
+  AppRepoUrl:
+    Type: String
+    Default: https://github.com/akim-ruslanov/show-pickr.git
+    Description: Public clone URL the instance bootstraps from.
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+    Description: EC2 instance size.
+
+  RootVolumeSizeGb:
+    Type: Number
+    Default: 20
+    Description: Root EBS volume size in GiB (Docker images + node build need more than the 8 GiB default).
+
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: Optional Route 53 hosted zone id. When set with DomainName, an A record is created for the Elastic IP.
+
+  DomainName:
+    Type: String
+    Default: ""
+    Description: Optional backend domain (e.g. api.example.com) for Caddy HTTPS and the Route 53 A record.
+
+Conditions:
+  HasDns: !And
+    - !Not [!Equals [!Ref HostedZoneId, ""]]
+    - !Not [!Equals [!Ref DomainName, ""]]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # GitHub Actions OIDC provider + the role the workflow assumes.
+  # ---------------------------------------------------------------------------
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # AWS now validates GitHub's HTTPS cert through its trusted root-CA library,
+      # so this value is a placeholder that is not actually pinned anymore.
+      # (Historical GitHub top-intermediate thumbprint, kept for compatibility.)
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+      Tags:
+        - Key: Name
+          Value: github-actions-oidc
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: showpickr-github-deploy-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOidcProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                # Tighten to "repo:<owner/repo>:ref:refs/heads/main" if you
+                # only deploy from main.
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubRepo}:*"
+      Policies:
+        - PolicyName: showpickr-deploy-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DiscoverInstance
+                Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              - Sid: ReadStackOutputs
+                Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/showpickr-backend/*"
+              - Sid: CheckSsmConnectivity
+                Effect: Allow
+                Action: ssm:DescribeInstanceInformation
+                Resource: "*"
+              - Sid: RunSsmCommands
+                Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                Resource: "*"
+              - Sid: ReadSsmOutput
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "${SsmOutputBucket.Arn}"
+                  - !Sub "${SsmOutputBucket.Arn}/*"
+
+  # ---------------------------------------------------------------------------
+  # Instance role: lets the SSM agent register and upload command output to S3.
+  # ---------------------------------------------------------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: showpickr-backend-instance-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: showpickr-ssm-s3-output
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${SsmOutputBucket.Arn}/*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # ---------------------------------------------------------------------------
+  # Networking: HTTP/HTTPS only. No SSH. Admin access is via SSM Session Manager.
+  # ---------------------------------------------------------------------------
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ShowPickr backend (HTTP/HTTPS only, SSM for admin)
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIpv6: "::/0"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIpv6: "::/0"
+
+  SsmOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "showpickr-ssm-output-${AWS::AccountId}-${AWS::Region}"
+      Tags:
+        - Key: Name
+          Value: showpickr-ssm-output
+
+  # ---------------------------------------------------------------------------
+  # The EC2 instance, fully bootstrapped via user-data (no manual launch).
+  # ---------------------------------------------------------------------------
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref RootVolumeSizeGb
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: showpickr-backend
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            exec > /var/log/user-data.log 2>&1
+
+            # Docker + git + swap
+            dnf update -y
+            dnf install -y docker git amazon-ssm-agent
+            systemctl enable --now docker
+            systemctl enable --now amazon-ssm-agent
+
+            # Docker Compose v2 plugin
+            mkdir -p /usr/local/lib/docker/cli-plugins
+            curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
+              -o /usr/local/lib/docker/cli-plugins/docker-compose
+            chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+            # 1 GB swap so `npm install` / `tsc` don't OOM the 1 GB instance
+            fallocate -l 1G /swapfile
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+            # Clone the public repo the deploy workflow will `git pull` from.
+            # First `docker compose up` happens on the first deploy via SSM.
+            rm -rf /home/ec2-user/app
+            git clone ${AppRepoUrl} /home/ec2-user/app
+
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: showpickr-backend-eip
+
+  ElasticIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref Instance
+      AllocationId: !GetAtt ElasticIP.AllocationId
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasDns
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      TTL: "300"
+      ResourceRecords:
+        - !GetAtt ElasticIP.PublicIp
+
+Outputs:
+  BackendPublicIp:
+    Description: Elastic IP of the backend instance.
+    Value: !GetAtt ElasticIP.PublicIp
+  InstanceId:
+    Description: EC2 instance id.
+    Value: !Ref Instance
+  DeployRoleArn:
+    Description: Role assumed by the GitHub Actions workflow.
+    Value: !GetAtt DeployRole.Arn
+  SsmOutputBucket:
+    Description: S3 bucket that receives SSM command output.
+    Value: !Ref SsmOutputBucket

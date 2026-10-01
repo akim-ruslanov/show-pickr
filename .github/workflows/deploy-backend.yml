@@ -6,31 +6,185 @@ on:
     paths:
       - 'backend/**'
       - 'deploy/backend/**'
+      - 'deploy/aws/**'
       - '.github/workflows/deploy-backend.yml'
   workflow_dispatch:
+
+permissions:
+  id-token: write # required for OIDC role assumption
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-west-2' }}
+  AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+  INSTANCE_TAG: showpickr-backend
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.2.0
+      - name: Check configuration
+        run: |
+          if [ -z "$AWS_ROLE_ARN" ]; then
+            echo "::error::Set the AWS_ROLE_ARN repository variable (Settings → Secrets and variables → Actions → Variables)."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve instance
+        id: instance
+        run: |
+          INSTANCE_ID="$(aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --filters "Name=tag:Name,Values=$INSTANCE_TAG" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].InstanceId' \
+            --output text 2>/dev/null || true)"
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "::error::No running instance tagged Name=$INSTANCE_TAG. Run the one-time bootstrap (see deploy/AWS_SETUP.md)."
+            exit 1
+          fi
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "Resolved instance $INSTANCE_ID"
+
+      - name: Get deploy bucket
+        id: bucket
+        run: |
+          BUCKET="$(aws cloudformation describe-stacks \
+            --region "$AWS_REGION" \
+            --stack-name showpickr-backend \
+            --query 'Stacks[0].Outputs[?OutputKey==`SsmOutputBucket`].OutputValue | [0]' \
+            --output text 2>/dev/null || true)"
+          if [ -z "$BUCKET" ] || [ "$BUCKET" = "None" ]; then
+            echo "::error::Could not read the SsmOutputBucket output from stack showpickr-backend."
+            exit 1
+          fi
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          echo "Using SSM output bucket $BUCKET"
+
+      - name: Wait for SSM agent
+        run: |
+          INSTANCE_ID="${{ steps.instance.outputs.instance_id }}"
+          echo "Waiting for the SSM agent to come online..."
+          for i in $(seq 1 30); do
+            PING="$(aws ssm describe-instance-information \
+              --region "$AWS_REGION" \
+              --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+              --query 'InstanceInformationList[0].PingStatus' \
+              --output text 2>/dev/null || true)"
+            [ "$PING" = "Online" ] && { echo "SSM agent online."; exit 0; }
+            sleep 10
+          done
+          echo "::error::SSM agent did not come online for instance $INSTANCE_ID."
+          exit 1
+
+      - name: Send deploy command
+        id: send
         env:
-          # Values injected into the remote shell and used by deploy/backend/deploy.sh.
           MOTN_API_KEY: ${{ secrets.MOTN_API_KEY }}
           SITE_ADDRESS: ${{ secrets.SITE_ADDRESS }}
           FRONTEND_ORIGIN: ${{ secrets.FRONTEND_ORIGIN }}
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_SSH_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          port: ${{ secrets.EC2_SSH_PORT || 22 }}
-          command_timeout: 20m
-          envs: MOTN_API_KEY,SITE_ADDRESS,FRONTEND_ORIGIN
-          script: |
-            set -e
-            # Directory where the repo is cloned on the EC2 instance (see deploy/AWS_SETUP.md).
-            APP_DIR="/home/ec2-user/app"
-            cd "$APP_DIR"
-            git pull --ff-only
-            bash deploy/backend/deploy.sh
+        run: |
+          INSTANCE_ID="${{ steps.instance.outputs.instance_id }}"
+          BUCKET="${{ steps.bucket.outputs.bucket }}"
+          PREFIX="deploy-logs"
+
+          # Base64-encode secrets so special characters survive the remote command string.
+          MOTN_B64="$(printf '%s' "$MOTN_API_KEY" | base64 -w0)"
+          SITE_B64="$(printf '%s' "$SITE_ADDRESS" | base64 -w0)"
+          ORIGIN_B64="$(printf '%s' "$FRONTEND_ORIGIN" | base64 -w0)"
+
+          REMOTE_SCRIPT=$(cat <<'EOF'
+          set -e
+          # user-data clones the repo; wait for it to finish if this is the first deploy.
+          for i in $(seq 1 150); do
+            [ -d /home/ec2-user/app/.git ] && break
+            sleep 5
+          done
+          [ -d /home/ec2-user/app/.git ] || { echo "repo not cloned yet (user-data still running?)"; exit 1; }
+          cd /home/ec2-user/app
+          git pull --ff-only
+          export MOTN_API_KEY="$(printf '%s' 'MOTN_PLACEHOLDER' | base64 -d)"
+          export SITE_ADDRESS="$(printf '%s' 'SITE_PLACEHOLDER' | base64 -d)"
+          export FRONTEND_ORIGIN="$(printf '%s' 'ORIGIN_PLACEHOLDER' | base64 -d)"
+          bash deploy/backend/deploy.sh
+          EOF
+          )
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//MOTN_PLACEHOLDER/$MOTN_B64}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//SITE_PLACEHOLDER/$SITE_B64}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//ORIGIN_PLACEHOLDER/$ORIGIN_B64}"
+
+          PARAMS_JSON="$(jq -n --arg s "$REMOTE_SCRIPT" '{commands:[$s]}')"
+
+          COMMAND_ID="$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "$PARAMS_JSON" \
+            --comment "ShowPickr backend deploy" \
+            --output-s3-bucket-name "$BUCKET" \
+            --output-s3-key-prefix "$PREFIX" \
+            --query 'Command.CommandId' \
+            --output text)"
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+          echo "Sent SSM command $COMMAND_ID to $INSTANCE_ID"
+
+      - name: Wait for deploy to finish
+        id: wait
+        run: |
+          INSTANCE_ID="${{ steps.instance.outputs.instance_id }}"
+          COMMAND_ID="${{ steps.send.outputs.command_id }}"
+          STATUS="Pending"
+          for i in $(seq 1 120); do
+            sleep 10
+            STATUS="$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query 'Status' \
+              --output text 2>/dev/null || true)"
+            case "$STATUS" in
+              Success|Failed|Cancelled|TimedOut|DeliveryTimedOut) break ;;
+            esac
+          done
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "SSM command status: $STATUS"
+
+      - name: Report result
+        run: |
+          INSTANCE_ID="${{ steps.instance.outputs.instance_id }}"
+          COMMAND_ID="${{ steps.send.outputs.command_id }}"
+          STATUS="${{ steps.wait.outputs.status }}"
+          BUCKET="${{ steps.bucket.outputs.bucket }}"
+          PREFIX="deploy-logs"
+
+          echo "--- Full command output (from S3) ---"
+          aws s3 cp --recursive --region "$AWS_REGION" \
+            "s3://$BUCKET/$PREFIX/$COMMAND_ID/" /tmp/ssm-out >/dev/null 2>&1 || true
+          if [ -d /tmp/ssm-out ]; then
+            find /tmp/ssm-out -type f -print | while IFS= read -r f; do
+              echo "----- $f -----"
+              cat "$f" || true
+            done
+          fi
+
+          # Fallback if S3 output wasn't produced.
+          if [ -z "$(find /tmp/ssm-out -type f 2>/dev/null | head -1)" ]; then
+            echo "--- Fallback (API, truncated) ---"
+            aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query '{stdout: StandardOutputContent, stderr: StandardErrorContent}' \
+              --output text || true
+          fi
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::Deploy failed with SSM status $STATUS"
+            exit 1
+          fi
+          echo "Deploy succeeded."
