@@ -53,6 +53,9 @@ aws cloudformation deploy \
   Otherwise create the `api.example.com` A record manually, pointing at the Elastic IP.
 - The AMI defaults to `ami-0d53cc9bd365ad65b` (Amazon Linux 2023, us-west-2) — update it
   in the template when AWS rotates it.
+- Docker Compose is pinned to **v2.24.7** in the user-data (not `latest`). Amazon Linux
+  2023's `docker` package ships buildx 0.12.x, while newer Compose (v5.x) requires
+  buildx >= 0.17 and fails with `compose build requires buildx 0.17.0 or later`.
 
 Get the Elastic IP (if you aren't using Route 53):
 
@@ -154,6 +157,14 @@ in the `db-data` Docker volume).
   it up with, e.g. a cron `docker run --rm -v showpickr_db-data:/data ...` copy of
   `prod.db`, or switch to RDS Postgres later for multi-instance scaling.
 - Socket.io uses long-lived WebSockets; Caddy passes them through without extra config.
+- The backend must be HTTPS for the GitHub Pages site to call it (browsers block
+  mixed-content requests from an HTTPS page to a plain-HTTP backend). Point a domain at
+  the Elastic IP and set the `SITE_ADDRESS` secret to that domain (e.g.
+  `api.example.com`) so Caddy obtains a Let's Encrypt certificate; also set
+  `FRONTEND_ORIGIN` to the Pages origin (e.g. `https://USERNAME.github.io`). The
+  defaults `:80` / `*` only work for local/IP testing over HTTP.
+- If the frontend build calls `/api/...` as relative paths, the `VITE_API_URL` secret is
+  empty. Set it to the backend's HTTPS URL and re-run the frontend workflow.
 - If GitHub Pages is enabled but `VITE_BASE` is wrong, assets 404 — adjust it to `/` for
   a user/org site or `/<repo-name>/` for a project site (see `deploy-frontend.yml`).
 - The deploy role's OIDC trust allows `repo:akim-ruslanov/show-pickr:*`. Tighten it to
