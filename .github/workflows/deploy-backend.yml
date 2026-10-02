@@ -29,6 +29,13 @@ jobs:
             echo "::error::Set the AWS_ROLE_ARN repository variable (Settings → Secrets and variables → Actions → Variables)."
             exit 1
           fi
+          case "$AWS_ROLE_ARN" in
+            arn:aws:iam::[0-9]*:role/?*) : ;;
+            *)
+              echo "::error::AWS_ROLE_ARN is not a valid role ARN. Expected arn:aws:iam::<account-id>:role/<role-name>, got: $AWS_ROLE_ARN"
+              exit 1
+              ;;
+          esac
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
