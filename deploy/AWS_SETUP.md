@@ -45,17 +45,14 @@ cd path/to/show-pickr
 aws cloudformation deploy \
   --stack-name showpickr-backend \
   --template-file deploy/aws/backend-stack.yaml \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides \
-      GitHubRepo=akim-ruslanov/show-pickr \
-      HostedZoneId=ZXXXXXXXXXXXXX \
-      DomainName=api.example.com
+  --capabilities CAPABILITY_NAMED_IAM
 ```
 
-- `HostedZoneId` / `DomainName` are **optional**. Provide both if you use Route 53 — the
-  stack creates an `A` record for `api.example.com` → Elastic IP automatically. Otherwise
-  omit them and create the DNS record yourself pointing at the Elastic IP (see below).
-- The instance image is resolved from the latest Amazon Linux 2023 AMI automatically.
+- To use Route 53 for an automatic `A` record, add
+  `--parameter-overrides HostedZoneId=Z0123456789ABCDEF DomainName=api.example.com`.
+  Otherwise create the `api.example.com` A record manually, pointing at the Elastic IP.
+- The AMI defaults to `ami-0d53cc9bd365ad65b` (Amazon Linux 2023, us-west-2) — update it
+  in the template when AWS rotates it.
 
 Get the Elastic IP (if you aren't using Route 53):
 

@@ -4,11 +4,6 @@ Description: >
   (SSM-managed, no SSH), Elastic IP, and an S3 bucket for SSM command output.
 
 Parameters:
-  GitHubRepo:
-    Type: String
-    Default: akim-ruslanov/show-pickr
-    Description: GitHub owner/repo allowed to assume the deploy role.
-
   AppRepoUrl:
     Type: String
     Default: https://github.com/akim-ruslanov/show-pickr.git
@@ -82,9 +77,10 @@ Resources:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
               StringLike:
-                # Tighten to "repo:<owner/repo>:ref:refs/heads/main" if you
-                # only deploy from main.
-                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubRepo}:*"
+                # GitHub OIDC subjects include numeric IDs, e.g.
+                # repo:akim-ruslanov@47903606/show-pickr@1398762617:ref:refs/heads/main
+                # Match this repo across any ref (push + workflow_dispatch).
+                token.actions.githubusercontent.com:sub: "repo:akim-ruslanov@*/show-pickr@*:*"
       Policies:
         - PolicyName: showpickr-deploy-policy
           PolicyDocument:
