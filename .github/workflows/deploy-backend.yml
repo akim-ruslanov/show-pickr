@@ -37,6 +37,16 @@ jobs:
               ;;
           esac
 
+      - name: Debug OIDC token claims
+        run: |
+          RESPONSE=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com")
+          TOKEN=$(echo "$RESPONSE" | jq -r '.value')
+          PAYLOAD=$(echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+')
+          PAD=$(( (4 - ${#PAYLOAD} % 4) % 4 ))
+          PAYLOAD="$PAYLOAD$(printf '=%.0s' $(seq 1 $PAD))"
+          echo "--- OIDC token claims ---"
+          echo "$PAYLOAD" | base64 -d 2>/dev/null | jq '{sub, aud, iss, repository, ref, event_name, actor}'
+
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
